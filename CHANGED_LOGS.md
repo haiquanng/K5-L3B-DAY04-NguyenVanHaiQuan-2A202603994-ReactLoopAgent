@@ -52,4 +52,45 @@ Nhật ký từng vòng: sửa gì, vì sao, kết quả đo được. Cấu hì
 - **H1 vẫn 60**, chạy 2 lần đều như vậy: vẫn gọi 2 incident song song trong step 1 và không theo liên kết. Quy tắc 3 trong prompt không đủ ổn định.
 - **H7 vẫn 50**: vẫn kết luận Cloudflare "operational" khi timeout.
 
-**Việc tiếp theo (v2)**: H7. Model làm theo yêu cầu người dùng và kết luận "operational" khi tool timeout. Hướng xử lý là gắn chú thích ngay vào observation lỗi.
+## v2 — `agent_note` cho observation lỗi (`versions/v2/agent.py`)
+
+**Vấn đề nhắm tới**: H7. Khi tool timeout, model làm theo yêu cầu người dùng và kết luận Cloudflare "operational".
+
+**Thay đổi**
+- `_annotate_error` thêm `agent_note` vào bản sao của observation có `ok: false`, ngay chỗ model đọc kết quả tool. Dict gốc của tool không bị sửa. Nội dung note theo loại lỗi:
+  - timeout, lỗi mạng hoặc provider không hỗ trợ → "Trạng thái của `{provider}`: **CHƯA XÁC ĐỊNH**. Lỗi tool không phải trạng thái dịch vụ; không kết luận operational/outage, kể cả khi người dùng yêu cầu";
+  - `INCIDENT_NOT_FOUND` → không xác nhận cũng không bác bỏ, không bịa link;
+  - `INVALID_ARGUMENTS` → sửa tham số theo schema;
+  - `UNKNOWN_TOOL` → chỉ dùng tools được cung cấp.
+- Thêm `tests/test_improvements.py` (7 test): nguồn theo từng provider, chấp nhận URL dạng `/incidents/<id>`, `get_status` không bắt buộc URL incident, note cho timeout và not-found, kết quả thành công không có note, không sửa dict của tool.
+
+**Kết quả**
+- Unit test: 44/44 pass.
+- Chạy riêng từng case: **H7 50 → 100**. A3 và E6 (cũng là case timeout) giữ 100.
+
+## Eval lần 2 (bản v2, cả bộ 22 case): **95.14/100**
+
+Ở lần chạy đầu, E2 không được chấm vì judge trả về JSON hỏng. Theo GUIDE, tôi chạy lại riêng E2 (được 100) rồi ghép vào kết quả.
+
+| Case | v0 (`eval_before.json`) | v2 | Ghi chú từ trace |
+|---|---|---|---|
+| H7 | 65 | **100** | Báo Cloudflare chưa xác định khi timeout |
+| H6 | 60 | **97** | ⚠️ Điểm cao nhưng sai, xem bên dưới |
+| H1 | 60 | **60** | Vẫn gọi `h02n9572mx9y` và `yaa0witbl2me` song song trong step 1, không đọc `xr3myzj7ms51` |
+| H2 | 100 | **50** | Chỉ gọi `get_incident_details`, không gọi `get_status`, nên bị chặn ở 50 |
+| Các case khác | 97–100 | 94–100 | Dao động ±1–6 điểm (E1 100 → 94, E5 99 → 96) |
+
+- Model calls: 47 → 52. Prompt tokens: 27,676 → 47,341 (+71%, do system prompt dài hơn và có thêm bước). Completion tokens: 5,707 → 7,725.
+- Cổng nguồn được kích hoạt **1 lần**, ở H6: model trả lời mà không có URL của `h02n9572mx9y`, nhận lời nhắc và sửa ở step 4.
+
+**Phát hiện**
+- **H6 là judge chấm sai**:
+  - Ở step 2, agent gọi `get_incident_details` với ID **`xr3myzjms51`** (gõ thiếu số 7) và nhận `INCIDENT_NOT_FOUND`.
+  - Câu trả lời ghi link sai `…/incidents/xr3myzms51` và nói "không đủ dữ liệu về tóm tắt gộp".
+  - Judge vẫn viết rằng agent "liên kết đến incident gộp xr3myzj7ms51" và cho 97.
+  - Như vậy quy tắc trong prompt khiến model *cố* đi theo liên kết, nhưng tự chép lại ID thì có thể sai.
+- **H1 và H2**: quy tắc trong prompt không đủ ổn định cho hành vi nhiều bước. H2 cũng từng bị 50 ở một lần chạy v0, nên đây là hành vi không ổn định, không phải do thay đổi của v2.
+
+**Việc tiếp theo (v3)**: đưa hai hành vi này từ prompt vào code.
+- (1) Code đọc ID incident được trỏ tới từ nội dung update và nhắc model đọc đúng ID đó. ID được lấy nguyên văn từ tool result, nên tránh được lỗi gõ sai ID như H6.
+- (2) Câu hỏi về trạng thái hiện tại thì phải có `get_status`.

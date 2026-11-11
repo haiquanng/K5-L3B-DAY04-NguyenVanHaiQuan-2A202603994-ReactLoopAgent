@@ -1,4 +1,4 @@
-"""Agent loop cho Status Investigation Agent (v1: cổng kiểm tra nguồn + quy tắc bằng chứng)."""
+"""Agent loop cho Status Investigation Agent (v2: + agent_note cho observation lỗi)."""
 import json
 import re
 
@@ -37,6 +37,33 @@ def _parse_arguments(raw):
     if not isinstance(args, dict):
         return None, {'ok': False, 'error': 'INVALID_ARGUMENTS', 'message': 'Arguments phải là JSON object.'}
     return args, None
+
+
+UNAVAILABLE = 'CHƯA XÁC ĐỊNH'
+
+
+def _annotate_error(args, result):
+    """Thêm agent_note vào observation lỗi để model không biến lỗi tool thành kết luận trạng thái.
+
+    Trả bản sao; không sửa dict gốc của tool.
+    """
+    if not isinstance(result, dict) or result.get('ok') is not False:
+        return result
+    target = (args or {}).get('provider') if isinstance(args, dict) else None
+    target = target or 'provider được yêu cầu'
+    code = str(result.get('error', ''))
+    if code == 'INCIDENT_NOT_FOUND':
+        note = ('Không tìm thấy ID trong phạm vi dữ liệu tool. Điều này KHÔNG xác nhận và cũng KHÔNG bác bỏ '
+                'incident tồn tại. Không bịa trạng thái, phạm vi hay link cho ID này.')
+    elif code == 'INVALID_ARGUMENTS':
+        note = 'Tham số sai định dạng. Sửa theo schema của tool rồi gọi lại nếu vẫn cần dữ liệu này.'
+    elif code == 'UNKNOWN_TOOL':
+        note = 'Tool không tồn tại. Chỉ dùng tools được cung cấp.'
+    else:  # timeout, lỗi mạng, provider không hỗ trợ, lỗi khác
+        note = (f'Không lấy được dữ liệu cho {target}. Trạng thái của {target}: {UNAVAILABLE}. '
+                'Lỗi tool không phải là trạng thái dịch vụ. Không kết luận operational hay outage cho phần này, '
+                'kể cả khi người dùng yêu cầu; nói rõ phần nào chưa kiểm tra được và vẫn trả lời phần có dữ liệu.')
+    return {**result, 'agent_note': note}
 
 
 def _record_source(sources, name, result):
@@ -108,6 +135,7 @@ def run_agent(question, provider, tools, max_steps=6):
                     result = tools.execute(call['name'], args)
                 except Exception as exc:  # tool lỗi bất ngờ vẫn là observation
                     result = {'ok': False, 'error': type(exc).__name__, 'message': str(exc)[:200]}
+            result = _annotate_error(args, result)
             _record_source(sources, call['name'], result)
             trace.append({'event': 'tool', 'step': step, 'name': call['name'],
                           'arguments': args if args is not None else call.get('arguments'), 'result': result})
