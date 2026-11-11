@@ -3,6 +3,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -153,6 +154,91 @@ class StatusGateTests(unittest.TestCase):
         fake = FakeProvider([tool_call('1', 'get_incident_details', self.T89), final(self.url)])
         history = run_agent('Incident GitHub t89g2q1800fr ảnh hưởng gì?', fake, StatusTools())
         self.assertFalse(any(x['event'] == 'validation_missing_status' for x in history['trace']))
+
+
+class RateLimitTests(unittest.TestCase):
+    """v3: giới hạn retry 429 và đọc Retry-After (tools bonus)."""
+
+    def vercel_calls(self, n):
+        return [tool_call(str(i), 'get_vercel_status', '{}') for i in range(n)]
+
+    def test_persistent_429_stops_after_three_attempts(self):
+        from bonus.tools import BonusTools
+        fake = FakeProvider(self.vercel_calls(5) + [final('Vercel chưa xác định.')])
+        result = run_agent('x', fake, BonusTools(scenario='rate_limit_always'), max_steps=8)
+        self.assertEqual(result['status'], 'completed')
+        executed = [x for x in result['trace'] if x['event'] == 'tool' and x['name'] == 'get_vercel_status']
+        blocked = [x for x in result['trace'] if x['event'] == 'tool_blocked']
+        self.assertEqual(len(executed), 3)
+        self.assertEqual(len(blocked), 2)
+        self.assertIn(UNAVAILABLE, json.loads(fake.histories[3][-1]['content'])['agent_note'])
+
+    def test_transient_429_then_success(self):
+        from bonus.tools import BonusTools
+        fake = FakeProvider(self.vercel_calls(2) + [final()])
+        result = run_agent('x', fake, BonusTools(scenario='rate_limit_once'), max_steps=5)
+        first = json.loads(fake.histories[1][-1]['content'])
+        self.assertIn('KHÔNG phải outage', first['agent_note'])
+        self.assertEqual(json.loads(fake.histories[2][-1]['content'])['provider'], 'vercel')
+        self.assertEqual(result['status'], 'completed')
+
+    def make_tools(self, retry_after):
+        class Tools:
+            schemas, system_prompt = [], 'bonus'
+            def execute(self, name, args):
+                return {'ok': False, 'error': 'RATE_LIMITED', 'http_status': 429, 'retriable': True, 'retry_after': retry_after}
+        return Tools()
+
+    def test_short_retry_after_waits(self):
+        with patch('agent.time.sleep') as sleep:
+            run_agent('x', FakeProvider(self.vercel_calls(1) + [final()]), self.make_tools('2'))
+        sleep.assert_called_once_with(2.0)
+
+    def test_long_retry_after_stops_without_waiting(self):
+        with patch('agent.time.sleep') as sleep:
+            result = run_agent('x', FakeProvider(self.vercel_calls(2) + [final()]), self.make_tools('120'))
+        sleep.assert_not_called()
+        self.assertEqual(sum(x['event'] == 'tool_blocked' for x in result['trace']), 1)
+
+    def test_bonus_prompt_gets_extra_rules(self):
+        fake = FakeProvider([final()])
+        run_agent('x', fake, self.make_tools('0'))
+        self.assertTrue(fake.histories[0][0]['content'].startswith('bonus'))
+        self.assertIn('Quy tắc bổ sung', fake.histories[0][0]['content'])
+        self.assertIn('429', fake.histories[0][0]['content'])
+
+
+class BonusGateTests(unittest.TestCase):
+    """v4: các cổng của v3 chạy đúng với 5 provider của bộ bonus."""
+
+    def test_unknown_host_link_is_ignored(self):
+        # Incident DigitalOcean lrrw084g3whn có link tới status.claude.com (provider không được hỗ trợ).
+        from bonus.tools import BonusTools
+        args = '{"provider":"digitalocean","incident_id":"lrrw084g3whn","offset":0,"limit":3}'
+        url = BonusTools().get_incident_details('digitalocean', 'lrrw084g3whn')['url']
+        fake = FakeProvider([tool_call('1', 'get_incident_details', args), final(url)])
+        result = run_agent('x', fake, BonusTools(), max_steps=4)
+        self.assertNotIn('agent_note', json.loads(fake.histories[1][-1]['content']))
+        self.assertFalse(any(x['event'] == 'validation_unread_reference' for x in result['trace']))
+
+    def test_cross_provider_link_is_flagged(self):
+        # Trang 2 timeline Vercel sps6n39gm4sg trỏ tới incident GitHub 93njd414rpbx.
+        from bonus.tools import BonusTools
+        args = '{"provider":"vercel","incident_id":"sps6n39gm4sg","offset":3,"limit":3}'
+        fake = FakeProvider([tool_call('1', 'get_incident_details', args), final('x')])
+        run_agent('x', fake, BonusTools(), max_steps=2)
+        note = json.loads(fake.histories[1][-1]['content'])['agent_note']
+        self.assertIn("provider='github', incident_id='93njd414rpbx'", note)
+
+    def test_status_gate_names_bonus_tool(self):
+        from bonus.tools import BonusTools
+        args = '{"provider":"npm","incident_id":"cc0t2r4403sy"}'
+        url = BonusTools().get_incident_details('npm', 'cc0t2r4403sy')['url']
+        fake = FakeProvider([tool_call('1', 'get_incident_details', args), final(url),
+                             tool_call('2', 'get_npm_status', '{}'), final(url)])
+        result = run_agent('npm hiện có ổn không?', fake, BonusTools(), max_steps=6)
+        self.assertEqual(result['status'], 'completed')
+        self.assertIn('get_npm_status()', fake.histories[2][-1]['content'])
 
 
 if __name__ == '__main__':

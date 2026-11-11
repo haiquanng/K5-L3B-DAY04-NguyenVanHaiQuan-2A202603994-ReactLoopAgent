@@ -148,3 +148,53 @@ Nhật ký từng vòng: sửa gì, vì sao, kết quả đo được. Cấu hì
 - Judge (gpt-4.1) có thể chấm sai: ví dụ H6 ở eval lần 2.
 - Các cổng dựa trên quy tắc chuỗi (regex link `/incidents/<id>`, từ chỉ thời điểm hiện tại). Chúng không hiểu ngữ nghĩa và có thể bỏ sót cách diễn đạt khác.
 - Điều kiện của cổng `get_status` đã được chỉnh sau khi thấy H3, nên có nguy cơ khớp quá sát bộ eval.
+
+## v4 — Bonus: kết nối 5 provider, giới hạn retry 429, Retry-After (`versions/v4/agent.py`)
+
+**Thay đổi**
+1. **Kết nối tools**:
+   - Agent dùng `getattr(tools, 'schemas', SCHEMAS)`.
+   - Khi tools có `system_prompt` (bộ bonus), system prompt = `tools.system_prompt` + `BONUS_RULES`. `BONUS_RULES` có 7 quy tắc:
+     - nguồn và `captured_at` theo từng provider;
+     - 429 không phải outage, tối đa 3 lần thử;
+     - sửa `offset`/`limit` khi tham số sai;
+     - đọc tiếp bằng `next_offset`;
+     - bỏ qua dữ liệu nhiễu;
+     - không bịa thông tin cho provider không có tool;
+     - không suy nhân quả giữa các provider.
+   - Tools bài chính chạy như cũ.
+2. **Retry 429 bằng code (`_run_tool`)**:
+   - Đếm theo cặp (tool, provider). Sau 3 lần `RATE_LIMITED`, agent **không gọi API nữa**: trả `RETRY_LIMIT_REACHED` cho model và ghi event `tool_blocked`. Gọi thành công thì bộ đếm reset.
+   - Đọc `retry_after_seconds` hoặc header `Retry-After` (số giây hoặc HTTP-date). Thời gian chờ ≤ 5 giây thì `sleep` và ghi `retry_wait`; lâu hơn, hoặc `retriable: false`, thì dừng thử ngay.
+   - `agent_note` cho 429 nói rõ "KHÔNG phải outage" và số lượt còn lại.
+3. **Tổng quát hoá các cổng của v3 cho 5 provider**:
+   - Danh sách provider được hỗ trợ suy từ schema (enum `provider` và tên `get_<provider>_status`).
+   - Cổng `get_status` nhận cả `get_<provider>_status` và nhắc đúng tên tool, ví dụ `get_npm_status()`.
+4. **Sửa lỗi tiềm ẩn ở `_flag_references`**:
+   - Bản v3 gặp host lạ thì gán cho provider đang đọc.
+   - Incident DigitalOcean `lrrw084g3whn` có link `status.claude.com/incidents/8z7l5zcy0v3b`, nên agent sẽ bị nhắc gọi `get_incident_details('digitalocean', '8z7l5zcy0v3b')` và chắc chắn nhận `NOT_FOUND`.
+   - Giờ host không thuộc provider được hỗ trợ thì bỏ qua.
+   - Link chéo hợp lệ vẫn được nhận: Vercel `sps6n39gm4sg` → GitHub `93njd414rpbx`.
+5. **Thêm 8 test**:
+   - 5 test `RateLimitTests`: 429 kéo dài chỉ gọi 3 lần, 429 một lần rồi thành công, Retry-After ngắn thì chờ, Retry-After dài thì dừng, prompt bonus;
+   - 3 test `BonusGateTests`: bỏ qua host lạ, nhận link chéo provider, cổng `get_status` nhắc đúng tool bonus.
+
+**Kết quả**
+- Unit test: 60/60 pass trong `tests/`; 3/3 pass trong `bonus/`.
+- Eval bonus cả bộ (`logs/eval_bonus_v4.json`): **89.2/100 → 13.38/15**.
+  - Trung bình 2.8 model calls mỗi case. Prompt tokens 45,811, completion tokens 4,453.
+  - B3, B4, B7, B8, B9: 100. B1, B5: 98. B2: 96.
+  - Trace cho thấy cơ chế mới chạy đúng:
+    - B3 gặp 429 rồi thử lại thành công;
+    - B4 thử đúng 3 lần rồi dừng, báo Vercel chưa xác định;
+    - B5 sửa tham số rồi gọi lại;
+    - B2 đọc trang `offset=3` rồi đọc incident GitHub `93njd414rpbx` nhờ `agent_note`.
+  - **B10 = 50**:
+    - Vercel trả 429 ở lần gọi đầu.
+    - `agent_note` báo còn 2 lượt thử, nhưng model trả lời luôn rằng Vercel chưa xác định, không thử lại.
+    - Kiểm tra bằng code yêu cầu gọi `get_vercel_status` ít nhất 2 lần.
+  - **B6 = 50**: chỉ gọi `get_vercel_status` và `get_npm_status` rồi so sánh dựa trên danh sách tiêu đề, **không đọc chi tiết incident nào**. Case bắt buộc có `get_incident_details`.
+
+**Việc tiếp theo (v5)**
+- (1) Khi model sắp trả lời mà vẫn còn một 429 có thể thử lại và chưa có lần gọi thành công, nhắc model thử lại.
+- (2) Câu hỏi đối chiếu incident cụ thể (phạm vi, ảnh hưởng) thì phải đọc chi tiết incident, không chỉ dựa vào danh sách tiêu đề.

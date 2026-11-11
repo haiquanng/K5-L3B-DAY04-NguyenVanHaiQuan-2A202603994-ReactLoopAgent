@@ -1,8 +1,10 @@
-"""Agent loop cho Status Investigation Agent (v3: + cổng đọc incident được trỏ tới, quy tắc get_status)."""
+"""Agent loop cho Status Investigation Agent (v4: + hỗ trợ bonus: tools riêng, giới hạn retry 429, Retry-After)."""
+import email.utils
 import json
 import re
+import time
 
-from status_tools import HOSTS, SCHEMAS
+from status_tools import SCHEMAS
 
 SYSTEM_PROMPT = '''Bạn là trợ lý điều tra trạng thái GitHub và Cloudflare.
 Dùng tools trước khi khẳng định về trạng thái. Phân biệt incident hiện tại và lịch sử,
@@ -19,11 +21,25 @@ Quy tắc bằng chứng:
 6. Nếu câu hỏi ngoài phạm vi status hoặc người dùng yêu cầu không kiểm tra, trả lời mà không gọi tool.
 7. Muốn khẳng định hoặc bác bỏ trạng thái HIỆN TẠI của một dịch vụ (đang outage, đang bình thường...), phải gọi get_status cho provider đó (kèm component nếu có). Trạng thái của một incident (resolved, monitoring...) chỉ nói về incident đó, không thay cho trạng thái hiện tại của dịch vụ.'''
 
+# Prompt riêng cho bộ tools bonus: nối sau tools.system_prompt.
+BONUS_RULES = '''Quy tắc bổ sung:
+1. Mỗi provider được nhắc tới cần nguồn riêng: `url` của incident đã đọc, hoặc `source` của status tool; nêu `captured_at` riêng cho từng provider.
+2. RATE_LIMITED (HTTP 429) là giới hạn truy cập, không phải outage. Chỉ thử lại khi `retriable` là true, tối đa 3 lần cho mỗi tool và provider; hết lượt thì trạng thái provider đó là CHƯA XÁC ĐỊNH và vẫn trả lời phần còn lại.
+3. INVALID_ARGUMENTS: sửa kiểu tham số (offset và limit là integer, limit từ 1 đến 3) rồi gọi lại.
+4. Nếu câu hỏi cần update ở trang sau, gọi tiếp get_incident_details với `next_offset`; nếu chưa đọc hết timeline thì nói rõ.
+5. Bỏ qua mục nhiễu không liên quan; chỉ dùng bằng chứng liên quan tới câu hỏi.
+6. Không có tool cho một provider thì nói không có dữ liệu; không bịa trạng thái hay URL.
+7. Không kết luận quan hệ nhân quả giữa các provider khi dữ liệu không nói vậy.'''
+
 URL_RE = re.compile(r'https?://[^\s)\]>"\'`]+')
+STATUS_TOOL_RE = re.compile(r'^get_([a-z0-9]+)_status$')   # tool status của bộ bonus: get_<provider>_status
 INCIDENT_LINK_RE = re.compile(r'https?://([^/\s]+)/incidents/([a-z0-9]+)')
 # Câu hỏi nói về trạng thái ở thời điểm HIỆN TẠI (dùng cho cổng get_status). Chỉ dùng từ chỉ thời điểm;
 # từ như "sập"/"outage" đứng riêng có thể nói về một sự kiện đã qua (H3: "vừa làm Cloudflare sập").
 CURRENT_STATE_RE = re.compile(r'(đang|hiện tại|hiện có|hiện nay|bây giờ)', re.I)
+UNAVAILABLE = 'CHƯA XÁC ĐỊNH'
+MAX_RATE_LIMIT_ATTEMPTS = 3   # số lần gọi bị 429 tối đa cho mỗi (tool, provider)
+MAX_RETRY_WAIT = 5.0          # giây; Retry-After dài hơn thì dừng thử lại thay vì chờ
 
 
 def _result(status, answer, trace, usage, error=None):
@@ -44,17 +60,54 @@ def _parse_arguments(raw):
     return args, None
 
 
-UNAVAILABLE = 'CHƯA XÁC ĐỊNH'
+
+def _tool_names(schemas):
+    return [x.get('function', {}).get('name', '') for x in schemas]
 
 
-def _annotate_error(args, result):
+def _supported_providers(schemas):
+    """Provider mà bộ tools hỗ trợ: enum `provider` trong schema và tên tool get_<provider>_status."""
+    found = []
+    for x in schemas:
+        fn = x.get('function', {})
+        match = STATUS_TOOL_RE.match(fn.get('name', ''))
+        names = [match.group(1)] if match else []
+        names += fn.get('parameters', {}).get('properties', {}).get('provider', {}).get('enum', [])
+        found += [n for n in names if n not in found]
+    return found
+
+
+def _target(name, args):
+    """Provider mà một tool call nhắm tới: từ arguments hoặc từ tên tool bonus get_<provider>_status."""
+    if isinstance(args, dict) and isinstance(args.get('provider'), str):
+        return args['provider']
+    match = STATUS_TOOL_RE.match(name or '')
+    return match.group(1) if match else None
+
+
+def _retry_after_seconds(result):
+    """Đọc thời gian chờ từ observation 429: retry_after_seconds hoặc header Retry-After (giây hay HTTP-date)."""
+    value = result.get('retry_after_seconds', result.get('retry_after'))
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(str(value))
+        return max(0.0, when.timestamp() - time.time())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def _annotate_error(target, result, retries_left=None):
     """Thêm agent_note vào observation lỗi để model không biến lỗi tool thành kết luận trạng thái.
 
     Trả bản sao; không sửa dict gốc của tool.
     """
     if not isinstance(result, dict) or result.get('ok') is not False:
         return result
-    target = (args or {}).get('provider') if isinstance(args, dict) else None
     target = target or 'provider được yêu cầu'
     code = str(result.get('error', ''))
     if code == 'INCIDENT_NOT_FOUND':
@@ -64,11 +117,45 @@ def _annotate_error(args, result):
         note = 'Tham số sai định dạng. Sửa theo schema của tool rồi gọi lại nếu vẫn cần dữ liệu này.'
     elif code == 'UNKNOWN_TOOL':
         note = 'Tool không tồn tại. Chỉ dùng tools được cung cấp.'
+    elif code in ('RATE_LIMITED', 'RETRY_LIMIT_REACHED'):
+        note = f'429/rate limit của {target} là giới hạn truy cập, KHÔNG phải outage. '
+        if retries_left:
+            note += f'Có thể thử lại tối đa {retries_left} lần nữa.'
+        else:
+            note += (f'Đã hết lượt thử lại; không gọi lại. Trạng thái của {target}: {UNAVAILABLE}. '
+                     'Báo rõ phần này và vẫn trả lời phần có dữ liệu.')
     else:  # timeout, lỗi mạng, provider không hỗ trợ, lỗi khác
         note = (f'Không lấy được dữ liệu cho {target}. Trạng thái của {target}: {UNAVAILABLE}. '
                 'Lỗi tool không phải là trạng thái dịch vụ. Không kết luận operational hay outage cho phần này, '
                 'kể cả khi người dùng yêu cầu; nói rõ phần nào chưa kiểm tra được và vẫn trả lời phần có dữ liệu.')
     return {**result, 'agent_note': note}
+
+
+def _run_tool(tools, name, args, target, rate_limited):
+    """Thực thi một call, hoặc chặn khi đã hết lượt retry 429. Trả (observation, event, giây đã chờ)."""
+    key = (name, target)
+    if rate_limited.get(key, 0) >= MAX_RATE_LIMIT_ATTEMPTS:
+        # Không gọi API nữa: tránh gọi liên tục khi 429 kéo dài.
+        blocked = {'ok': False, 'error': 'RETRY_LIMIT_REACHED', 'retriable': False,
+                   'message': f'Đã gặp 429 {MAX_RATE_LIMIT_ATTEMPTS} lần; agent không gọi lại.'}
+        return _annotate_error(target, blocked), 'tool_blocked', None
+    try:
+        result = tools.execute(name, args)
+    except Exception as exc:  # tool lỗi bất ngờ vẫn là observation
+        result = {'ok': False, 'error': type(exc).__name__, 'message': str(exc)[:200]}
+    retries_left, waited = None, None
+    if isinstance(result, dict) and result.get('error') == 'RATE_LIMITED':
+        rate_limited[key] = rate_limited.get(key, 0) + 1
+        wait = _retry_after_seconds(result)
+        if not result.get('retriable', True) or (wait is not None and wait > MAX_RETRY_WAIT):
+            rate_limited[key] = MAX_RATE_LIMIT_ATTEMPTS  # chờ quá budget hoặc không retry được: dừng
+        elif wait:
+            time.sleep(wait)
+            waited = wait
+        retries_left = MAX_RATE_LIMIT_ATTEMPTS - rate_limited[key]
+    elif isinstance(result, dict) and result.get('ok') is not False:
+        rate_limited.pop(key, None)
+    return _annotate_error(target, result, retries_left), 'tool', waited
 
 
 def _record_source(sources, name, result):
@@ -93,15 +180,17 @@ def _missing_sources(answer, sources):
     return missing
 
 
-def _provider_for_host(host, default):
-    """Suy provider từ host của link (vd www.githubstatus.com → github); không khớp thì giữ provider hiện tại."""
-    for name, url in HOSTS.items():
-        if url.split('://', 1)[1] == host:
-            return name
-    return default
+def _provider_for_host(host, providers):
+    """Suy provider từ host của link (vd www.githubstatus.com → github).
+
+    Host không thuộc provider nào được hỗ trợ (vd status.claude.com) thì trả None để bỏ qua,
+    thay vì gán nhầm cho provider đang đọc.
+    """
+    host = host.casefold()
+    return next((p for p in providers if p in host), None)
 
 
-def _flag_references(name, result, attempted, refs):
+def _flag_references(name, result, attempted, refs, providers):
     """Tìm link `/incidents/<id>` trong updates của incident vừa đọc.
 
     ID được lấy nguyên văn từ tool result rồi ghi vào agent_note, để model gọi đúng ID thay vì tự chép lại.
@@ -111,8 +200,8 @@ def _flag_references(name, result, attempted, refs):
     found = []
     for update in result.get('updates', []):
         for host, iid in INCIDENT_LINK_RE.findall(str(update.get('body', ''))):
-            ref = (_provider_for_host(host, result.get('provider')), iid)
-            if iid != result.get('id') and ref not in attempted and ref not in found:
+            ref = (_provider_for_host(host, providers), iid)
+            if ref[0] and ref != (result.get('provider'), result.get('id')) and ref not in attempted and ref not in found:
                 found.append(ref)
     if not found:
         return result
@@ -126,18 +215,23 @@ def _flag_references(name, result, attempted, refs):
 
 def run_agent(question, provider, tools, max_steps=6):
     """Trả dict: status (completed|max_steps|error), answer, trace, usage (+ error)."""
-    messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': question}]
-    trace, usage, sources = [], [], {}
+    # Bonus (v4): dùng schemas/system_prompt của bộ tools nếu có; giữ tương thích tools bài chính.
+    schemas = getattr(tools, 'schemas', SCHEMAS)
+    bonus_prompt = getattr(tools, 'system_prompt', None)
+    system = f'{bonus_prompt}\n\n{BONUS_RULES}' if bonus_prompt else SYSTEM_PROMPT
+    providers, tool_names = _supported_providers(schemas), _tool_names(schemas)
+    messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': question}]
+    trace, usage, sources, rate_limited = [], [], {}, {}
     # refs: incident được update trỏ tới -> incident nguồn; attempted: (provider, id) đã gọi get_incident_details;
     # reminded: ref đã nhắc ở cổng cuối (chỉ nhắc một lần để không lặp vô hạn).
     refs, attempted, reminded = {}, set(), set()
     # Cổng get_status: provider được nhắc trong câu hỏi về trạng thái hiện tại; status_checked: đã gọi get_status.
-    asks_current = [p for p in HOSTS if p in question.casefold()] if CURRENT_STATE_RE.search(question) else []
+    asks_current = [p for p in providers if p in question.casefold()] if CURRENT_STATE_RE.search(question) else []
     status_checked, status_reminded = set(), False
     for step in range(1, max_steps + 1):
         # Lỗi provider kết thúc run: không báo hoàn thành.
         try:
-            response = provider.complete(messages, SCHEMAS)
+            response = provider.complete(messages, schemas)
         except Exception as exc:  # RuntimeError/ValueError/KeyError... từ adapter
             trace.append({'event': 'provider_error', 'step': step, 'error': str(exc)[:200]})
             return _result('error', '', trace, usage, f'Lỗi provider: {str(exc)[:200]}')
@@ -174,7 +268,8 @@ def run_agent(question, provider, tools, max_steps=6):
             if no_status and used_tools and not status_reminded and step < max_steps:
                 status_reminded = True
                 trace.append({'event': 'validation_missing_status', 'step': step, 'providers': no_status})
-                hint = '; '.join(f"get_status(provider='{p}')" for p in no_status)
+                hint = '; '.join(f'get_{p}_status()' if f'get_{p}_status' in tool_names else f"get_status(provider='{p}')"
+                                 for p in no_status)
                 messages.append({'role': 'user', 'content': (
                     '[Kiểm tra tự động của hệ thống] Câu hỏi nói về trạng thái HIỆN TẠI nhưng bạn chưa kiểm tra '
                     f'trạng thái hiện tại. Trạng thái của một incident không thay cho trạng thái dịch vụ. Hãy gọi {hint} '
@@ -194,22 +289,22 @@ def run_agent(question, provider, tools, max_steps=6):
 
         # Xử lý MỌI call, mỗi call một tool message đúng tool_call_id.
         for call in calls:
+            name = call['name']
             args, err = _parse_arguments(call.get('arguments'))
+            target = _target(name, args)
             if err:
-                result = err
+                result, event = _annotate_error(target, err), 'tool'
             else:
-                try:
-                    result = tools.execute(call['name'], args)
-                except Exception as exc:  # tool lỗi bất ngờ vẫn là observation
-                    result = {'ok': False, 'error': type(exc).__name__, 'message': str(exc)[:200]}
-            result = _annotate_error(args, result)
-            if call['name'] == 'get_incident_details' and isinstance(args, dict):
-                attempted.add((args.get('provider'), args.get('incident_id')))
-            if call['name'] == 'get_status' and isinstance(args, dict):
-                status_checked.add(args.get('provider'))
-            result = _flag_references(call['name'], result, attempted, refs)
-            _record_source(sources, call['name'], result)
-            trace.append({'event': 'tool', 'step': step, 'name': call['name'],
+                result, event, waited = _run_tool(tools, name, args, target, rate_limited)
+                if waited:
+                    trace.append({'event': 'retry_wait', 'step': step, 'name': name, 'seconds': waited})
+                if name == 'get_incident_details':
+                    attempted.add((args.get('provider'), args.get('incident_id')))
+                if name == 'get_status' or STATUS_TOOL_RE.match(name):
+                    status_checked.add(target)
+                result = _flag_references(name, result, attempted, refs, providers)
+                _record_source(sources, name, result)
+            trace.append({'event': event, 'step': step, 'name': name,
                           'arguments': args if args is not None else call.get('arguments'), 'result': result})
             messages.append({'role': 'tool', 'tool_call_id': call['id'], 'content': json.dumps(result, ensure_ascii=False)})
 
