@@ -1,4 +1,4 @@
-"""Agent loop cho Status Investigation Agent (v4: + hỗ trợ bonus: tools riêng, giới hạn retry 429, Retry-After)."""
+"""Agent loop cho Status Investigation Agent (v5: + cổng nhắc retry 429, cổng đọc chi tiết incident khi cần đối chiếu)."""
 import email.utils
 import json
 import re
@@ -29,14 +29,21 @@ BONUS_RULES = '''Quy tắc bổ sung:
 4. Nếu câu hỏi cần update ở trang sau, gọi tiếp get_incident_details với `next_offset`; nếu chưa đọc hết timeline thì nói rõ.
 5. Bỏ qua mục nhiễu không liên quan; chỉ dùng bằng chứng liên quan tới câu hỏi.
 6. Không có tool cho một provider thì nói không có dữ liệu; không bịa trạng thái hay URL.
-7. Không kết luận quan hệ nhân quả giữa các provider khi dữ liệu không nói vậy.'''
+7. Không kết luận quan hệ nhân quả giữa các provider khi dữ liệu không nói vậy.
+8. Danh sách incident từ status tool chỉ có tiêu đề, trạng thái và thời điểm cập nhật. Khi câu hỏi cần phạm vi, ảnh hưởng, nguyên nhân hoặc so sánh/đối chiếu incident, gọi get_incident_details cho incident liên quan trước khi trả lời.'''
 
 URL_RE = re.compile(r'https?://[^\s)\]>"\'`]+')
 STATUS_TOOL_RE = re.compile(r'^get_([a-z0-9]+)_status$')   # tool status của bộ bonus: get_<provider>_status
 INCIDENT_LINK_RE = re.compile(r'https?://([^/\s]+)/incidents/([a-z0-9]+)')
-# Câu hỏi nói về trạng thái ở thời điểm HIỆN TẠI (dùng cho cổng get_status). Chỉ dùng từ chỉ thời điểm;
-# từ như "sập"/"outage" đứng riêng có thể nói về một sự kiện đã qua (H3: "vừa làm Cloudflare sập").
-CURRENT_STATE_RE = re.compile(r'(đang|hiện tại|hiện có|hiện nay|bây giờ)', re.I)
+# Câu hỏi nói về trạng thái DỊCH VỤ ở thời điểm hiện tại (dùng cho cổng get_status).
+# - "sập"/"outage" đứng riêng có thể nói về sự kiện đã qua (H3: "vừa làm Cloudflare sập") → không tính.
+# - "đang" đứng riêng quá rộng (B2: "sự cố đó đang xảy ra" hỏi về incident; B8: "ứng dụng đang chạy")
+#   → chỉ tính khi đi cùng từ chỉ trạng thái dịch vụ (v5).
+CURRENT_STATE_RE = re.compile(r'(hiện tại|hiện có|hiện nay|bây giờ|đang\s+(?:outage|operational|sập|lỗi|gặp sự cố|'
+                              r'có sự cố|hoạt động|bình thường|ổn|thế nào))', re.I)
+# Câu hỏi yêu cầu phạm vi/đối chiếu incident (cổng đọc chi tiết, v5). Không dùng "nguyên nhân"/"ảnh hưởng":
+# chúng hay xuất hiện trong câu phủ định ("đừng suy ra nguyên nhân") hoặc nghĩa khác (E5, B1, B10).
+DETAIL_RE = re.compile(r'(phạm vi|đối chiếu|so sánh|timeline)', re.I)
 UNAVAILABLE = 'CHƯA XÁC ĐỊNH'
 MAX_RATE_LIMIT_ATTEMPTS = 3   # số lần gọi bị 429 tối đa cho mỗi (tool, provider)
 MAX_RETRY_WAIT = 5.0          # giây; Retry-After dài hơn thì dừng thử lại thay vì chờ
@@ -228,6 +235,9 @@ def run_agent(question, provider, tools, max_steps=6):
     # Cổng get_status: provider được nhắc trong câu hỏi về trạng thái hiện tại; status_checked: đã gọi get_status.
     asks_current = [p for p in providers if p in question.casefold()] if CURRENT_STATE_RE.search(question) else []
     status_checked, status_reminded = set(), False
+    retry_reminded = set()   # (tool, provider) đã được nhắc thử lại sau 429 (v5)
+    # Cổng đọc chi tiết (v5): provider -> incident đầu tiên trong kết quả status tool (ứng viên để gợi ý).
+    needs_detail, status_candidates, detail_reminded = bool(DETAIL_RE.search(question)), {}, False
     for step in range(1, max_steps + 1):
         # Lỗi provider kết thúc run: không báo hoàn thành.
         try:
@@ -260,6 +270,30 @@ def run_agent(question, provider, tools, max_steps=6):
                 messages.append({'role': 'user', 'content': (
                     '[Kiểm tra tự động của hệ thống] Một update đã đọc trỏ tới incident khác nhưng bạn chưa đọc nó. '
                     f'Hãy gọi {calls_hint} (dùng đúng ID), rồi viết lại câu trả lời cuối dựa trên dữ liệu đó.')})
+                continue
+            # Cổng retry 429 (v5): còn (tool, provider) bị 429, còn lượt và chưa thành công thì nhắc thử lại một lần.
+            # Gọi thành công sẽ xoá key khỏi rate_limited; hết lượt thì đếm = MAX nên không nhắc.
+            pending = [k for k, n in rate_limited.items() if 0 < n < MAX_RATE_LIMIT_ATTEMPTS and k not in retry_reminded]
+            if pending and step < max_steps:
+                retry_reminded.update(pending)
+                trace.append({'event': 'validation_pending_retry', 'step': step,
+                              'pending': [{'tool': t, 'provider': p, 'attempts': rate_limited[(t, p)]} for t, p in pending]})
+                listing = '; '.join(f'{t} ({p}): đã 429 {rate_limited[(t, p)]} lần, còn '
+                                    f'{MAX_RATE_LIMIT_ATTEMPTS - rate_limited[(t, p)]} lượt' for t, p in pending)
+                messages.append({'role': 'user', 'content': (
+                    '[Kiểm tra tự động của hệ thống] Có tool bị rate limit (429) nhưng vẫn còn lượt thử lại: '
+                    f'{listing}. 429 không phải outage. Hãy gọi lại tool đó trước khi kết luận; '
+                    'nếu vẫn bị 429 thì báo trạng thái provider đó là CHƯA XÁC ĐỊNH.')})
+                continue
+            # Cổng đọc chi tiết (v5): câu hỏi cần phạm vi/đối chiếu mà chưa đọc incident nào thì nhắc một lần.
+            if needs_detail and not attempted and status_candidates and not detail_reminded and step < max_steps:
+                detail_reminded = True
+                trace.append({'event': 'validation_missing_detail', 'step': step, 'candidates': status_candidates})
+                hint = '; '.join(f"get_incident_details(provider='{p}', incident_id='{i}')" for p, i in status_candidates.items())
+                messages.append({'role': 'user', 'content': (
+                    '[Kiểm tra tự động của hệ thống] Câu hỏi cần phạm vi hoặc đối chiếu incident nhưng bạn chưa đọc chi tiết '
+                    'incident nào; danh sách từ status tool chỉ có tiêu đề và trạng thái. Hãy gọi get_incident_details cho '
+                    f'incident liên quan trước khi trả lời. Ứng viên (incident đầu tiên trong kết quả status): {hint}.')})
                 continue
             # Cổng get_status (v3): câu hỏi về trạng thái hiện tại mà chưa gọi get_status thì nhắc một lần.
             # Chỉ áp dụng khi agent đã dùng tool (câu hỏi ngoài phạm vi/không được kiểm tra thì bỏ qua).
@@ -302,6 +336,8 @@ def run_agent(question, provider, tools, max_steps=6):
                     attempted.add((args.get('provider'), args.get('incident_id')))
                 if name == 'get_status' or STATUS_TOOL_RE.match(name):
                     status_checked.add(target)
+                    if isinstance(result, dict) and result.get('incidents') and target:
+                        status_candidates.setdefault(target, result['incidents'][0].get('id'))
                 result = _flag_references(name, result, attempted, refs, providers)
                 _record_source(sources, name, result)
             trace.append({'event': event, 'step': step, 'name': name,

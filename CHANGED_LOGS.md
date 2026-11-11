@@ -198,3 +198,46 @@ Nhật ký từng vòng: sửa gì, vì sao, kết quả đo được. Cấu hì
 **Việc tiếp theo (v5)**
 - (1) Khi model sắp trả lời mà vẫn còn một 429 có thể thử lại và chưa có lần gọi thành công, nhắc model thử lại.
 - (2) Câu hỏi đối chiếu incident cụ thể (phạm vi, ảnh hưởng) thì phải đọc chi tiết incident, không chỉ dựa vào danh sách tiêu đề.
+
+## v5 — Bonus: sửa B10, B6 và thu hẹp cổng `get_status` (`versions/v5/agent.py`)
+
+**Thay đổi**
+1. **Cổng thử lại 429 (`validation_pending_retry`)**, cho B10:
+   - Khi model sắp trả lời mà vẫn còn cặp (tool, provider) bị 429, còn lượt và chưa có lần gọi thành công, agent nhắc thử lại **một lần** rồi gọi model tiếp.
+   - Hết 3 lượt thì không nhắc, nên B4 (429 kéo dài) không bị ảnh hưởng.
+2. **Đọc chi tiết incident khi cần đối chiếu**, cho B6:
+   - Thêm quy tắc 8 vào `BONUS_RULES`: danh sách từ status tool chỉ có tiêu đề; cần phạm vi hoặc đối chiếu thì phải gọi `get_incident_details`.
+   - Chạy riêng 2 lần được 100, nhưng ở lần chạy cả bộ B6 lại bị 50 (`logs/eval_bonus_v5a_prompt_only.json`). Quy tắc trong prompt lại không ổn định.
+   - Thêm cổng `validation_missing_detail`: câu hỏi có `phạm vi`/`đối chiếu`/`so sánh`/`timeline`, status tool đã trả incident, nhưng chưa đọc chi tiết incident nào → nhắc một lần, kèm ID ứng viên (incident đầu tiên trong kết quả status của mỗi provider).
+   - Bản đầu của điều kiện có cả "nguyên nhân" và "ảnh hưởng". Thử trên 32 câu hỏi thì bắt nhầm B1, B10 (câu phủ định "đừng suy ra nguyên nhân") và E5, nên tôi bỏ hai từ này.
+3. **Thu hẹp cổng `get_status` (`CURRENT_STATE_RE`)**:
+   - Ở lần chạy `logs/eval_bonus_v5b_wide_status_gate.json`, B2 giảm 96 → 84. Câu hỏi B2 "sự cố đó **đang** xảy ra" hỏi về *incident*, nhưng chữ "đang" vẫn kích hoạt cổng. Agent mở đầu bằng "Kiểm tra trạng thái hiện tại…", bỏ phần trích update của Vercel, và bị judge chê "hiện tại hoá" sự cố lịch sử.
+   - B8 cũng bị bắt nhầm vì cụm "ứng dụng đang chạy".
+   - Giờ "đang" chỉ được tính khi đi cùng từ chỉ trạng thái dịch vụ: outage, operational, hoạt động, bình thường, thế nào…
+   - Với bài chính, tập câu đủ điều kiện không đổi (E1, E6, H2, H5, H7).
+4. **Thêm 6 test**:
+   - 3 test `PendingRetryTests`: một lần 429 thì nhắc, chỉ nhắc một lần, hết lượt thì không nhắc;
+   - 2 test `DetailGateTests`: nhắc kèm đúng ứng viên, không nhắc với câu phủ định hoặc khi đã đọc chi tiết;
+   - 1 test regex cho "đang".
+
+**Kết quả**
+- Unit test: 66/66 pass trong `tests/`; 3/3 pass trong `bonus/`.
+- Chạy riêng: B10 **100, 100** (nhắc ở step 2, thử lại thành công ở step 3); B6 100 × 4 lần; B3, B4 100; B2 96.
+- **Eval bonus cả bộ → `eval_bonus.json`: 99.3/100 → 14.89/15** (v4: 89.2 → 13.38).
+
+| Case | v4 | v5 | Ghi chú từ trace |
+|---|---|---|---|
+| B10 | 50 | **100** | 429 → `validation_pending_retry` → thử lại thành công |
+| B6 | 50 | **100** | Đọc `w661l7k3kf4p` và `cc0t2r4403sy` |
+| B2 | 96 | 94 | Đọc trang `offset=3`, rồi đọc GitHub `93njd414rpbx`; không còn bị cổng `get_status` bắt nhầm |
+| B1, B3, B4, B7, B8, B9 | 98–100 | 100 | B4 thử đúng 3 lần rồi dừng |
+| B5 | 98 | 99 | Sửa tham số rồi gọi lại |
+
+- Trung bình 3 model calls mỗi case. Agent: 61,917 prompt tokens và 4,518 completion tokens (≈ $0.032). Judge: ≈ $0.068.
+- **Kiểm tra hồi quy bài chính bằng v5** (`logs/eval_main_v5.json`): **99.45** (v3: 99.59). Không case nào bị kiểm tra bằng code chặn trần. H1 và H6 vẫn đọc `xr3myzj7ms51` ở step 2; H2 vẫn được cổng `get_status` nhắc. Vì vậy giữ `eval_after.json` (bản v3) làm kết quả "after" của bài chính.
+
+**Giới hạn còn lại**
+- Cổng `validation_missing_detail` **chưa kích hoạt lần nào khi chạy thật**: cả 3 lần sau khi thêm, model đều tự đọc chi tiết nhờ quy tắc 8. Cổng mới được kiểm chứng bằng unit test và là lưới an toàn cho tỉ lệ thất bại khoảng 1/3 của riêng quy tắc prompt.
+- Ba điều kiện kích hoạt (`CURRENT_STATE_RE`, `DETAIL_RE`, link `/incidents/<id>`) là quy tắc chuỗi, đã được chỉnh sau khi nhìn kết quả eval, nên có nguy cơ khớp quá sát bộ case.
+- 429 và lỗi định dạng trong eval là giả lập với `retry_after_seconds: 0`. Nhánh chờ Retry-After thật, từ header dạng giây hoặc HTTP-date, mới được kiểm chứng bằng unit test.
+- Mỗi phiên bản chỉ chạy cả bộ một lần. B2 dao động 84–96 giữa các lần chạy.

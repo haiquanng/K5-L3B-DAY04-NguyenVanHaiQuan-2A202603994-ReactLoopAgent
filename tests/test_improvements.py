@@ -155,6 +155,14 @@ class StatusGateTests(unittest.TestCase):
         history = run_agent('Incident GitHub t89g2q1800fr ảnh hưởng gì?', fake, StatusTools())
         self.assertFalse(any(x['event'] == 'validation_missing_status' for x in history['trace']))
 
+    def test_dang_about_incident_or_apps_does_not_trigger(self):
+        # v5: B2 hỏi "sự cố đó đang xảy ra" (về incident), B8 nói "ứng dụng đang chạy".
+        from agent import CURRENT_STATE_RE
+        self.assertIsNone(CURRENT_STATE_RE.search('Có thể xác nhận sự cố đó đang xảy ra không?'))
+        self.assertIsNone(CURRENT_STATE_RE.search('ảnh hưởng ứng dụng đang chạy và build/deploy'))
+        for q in ('GitHub Actions đang outage', 'Actions đang thế nào', 'GitHub hiện có sự cố không'):
+            self.assertIsNotNone(CURRENT_STATE_RE.search(q), q)
+
 
 class RateLimitTests(unittest.TestCase):
     """v3: giới hạn retry 429 và đọc Retry-After (tools bonus)."""
@@ -239,6 +247,69 @@ class BonusGateTests(unittest.TestCase):
         result = run_agent('npm hiện có ổn không?', fake, BonusTools(), max_steps=6)
         self.assertEqual(result['status'], 'completed')
         self.assertIn('get_npm_status()', fake.histories[2][-1]['content'])
+
+
+class PendingRetryTests(unittest.TestCase):
+    """v5: còn lượt thử sau 429 thì nhắc thử lại một lần trước khi trả lời (lỗi B10)."""
+
+    def vercel(self, i):
+        return tool_call(str(i), 'get_vercel_status', '{}')
+
+    def events(self, result):
+        return [x for x in result['trace'] if x['event'] == 'validation_pending_retry']
+
+    def test_single_429_gets_retry_reminder(self):
+        from bonus.tools import BonusTools
+        fake = FakeProvider([self.vercel(1), final('Vercel chưa xác định.'), self.vercel(2), final('Vercel bình thường.')])
+        result = run_agent('x', fake, BonusTools(scenario='rate_limit_once'), max_steps=6)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(len(self.events(result)), 1)
+        calls = [x for x in result['trace'] if x['event'] == 'tool' and x['name'] == 'get_vercel_status']
+        self.assertEqual([x['result'].get('error') for x in calls], ['RATE_LIMITED', None])
+
+    def test_reminder_only_once_when_still_limited(self):
+        from bonus.tools import BonusTools
+        fake = FakeProvider([self.vercel(1), final('a'), self.vercel(2), final('Vercel chưa xác định.')])
+        result = run_agent('x', fake, BonusTools(scenario='rate_limit_always'), max_steps=6)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(len(self.events(result)), 1)
+
+    def test_no_reminder_after_attempts_exhausted(self):
+        from bonus.tools import BonusTools
+        fake = FakeProvider([self.vercel(1), self.vercel(2), self.vercel(3), final('Vercel chưa xác định.')])
+        result = run_agent('x', fake, BonusTools(scenario='rate_limit_always'), max_steps=6)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(self.events(result), [])
+
+
+class DetailGateTests(unittest.TestCase):
+    """v5: câu hỏi cần phạm vi/đối chiếu incident thì phải đọc chi tiết (lỗi B6)."""
+    Q = 'Kiểm tra Vercel Builds và npm package publishing, đối chiếu incident mới nhất: phạm vi, timestamp, nguồn.'
+
+    def status_calls(self):
+        first = tool_call('a', 'get_vercel_status', '{"component":"Builds"}')
+        second = tool_call('b', 'get_npm_status', '{"component":"publish"}')
+        first['calls'] += second['calls']
+        first['message']['tool_calls'] += second['message']['tool_calls']
+        return first
+
+    def test_compare_question_without_detail_gets_candidates(self):
+        from bonus.tools import BonusTools
+        fake = FakeProvider([self.status_calls(), final('Chỉ dựa vào danh sách.'), final('x')])
+        result = run_agent(self.Q, fake, BonusTools(), max_steps=3)
+        event = next(x for x in result['trace'] if x['event'] == 'validation_missing_detail')
+        self.assertEqual(event['candidates'], {'vercel': 'w661l7k3kf4p', 'npm': 'cc0t2r4403sy'})
+        self.assertIn("incident_id='w661l7k3kf4p'", fake.histories[2][-1]['content'])
+
+    def test_no_reminder_for_negated_cause_or_after_detail(self):
+        from bonus.tools import BonusTools
+        q = 'Tổng hợp status Vercel và npm. Đừng suy ra nguyên nhân liên quan giữa các bên.'
+        result = run_agent(q, FakeProvider([self.status_calls(), final('ok')]), BonusTools())
+        self.assertFalse(any(x['event'] == 'validation_missing_detail' for x in result['trace']))
+        url = BonusTools().get_incident_details('npm', 'cc0t2r4403sy')['url']
+        fake = FakeProvider([self.status_calls(), tool_call('c', 'get_incident_details', '{"provider":"npm","incident_id":"cc0t2r4403sy"}'), final(url)])
+        result = run_agent(self.Q, fake, BonusTools())
+        self.assertFalse(any(x['event'] == 'validation_missing_detail' for x in result['trace']))
 
 
 if __name__ == '__main__':
