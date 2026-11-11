@@ -1,8 +1,8 @@
-"""Agent loop cho Status Investigation Agent (v2: + agent_note cho observation lỗi)."""
+"""Agent loop cho Status Investigation Agent (v3: + cổng đọc incident được trỏ tới, quy tắc get_status)."""
 import json
 import re
 
-from status_tools import SCHEMAS
+from status_tools import HOSTS, SCHEMAS
 
 SYSTEM_PROMPT = '''Bạn là trợ lý điều tra trạng thái GitHub và Cloudflare.
 Dùng tools trước khi khẳng định về trạng thái. Phân biệt incident hiện tại và lịch sử,
@@ -16,9 +16,14 @@ Quy tắc bằng chứng:
 3. Nếu một update trỏ tới incident khác (ID hoặc đường dẫn), gọi get_incident_details cho incident đó trước khi kết luận về nguyên nhân hay ảnh hưởng.
 4. Tách rõ phần đã xác nhận từ dữ liệu và phần chưa xác nhận. Nêu `captured_at`; nếu `truncated` là true hoặc `updates_total` lớn hơn số update nhận được thì nói dữ liệu có thể đã bị lược bỏ.
 5. Không xác nhận tiền đề của người dùng khi dữ liệu không ủng hộ; nói rõ dữ liệu cho thấy gì.
-6. Nếu câu hỏi ngoài phạm vi status hoặc người dùng yêu cầu không kiểm tra, trả lời mà không gọi tool.'''
+6. Nếu câu hỏi ngoài phạm vi status hoặc người dùng yêu cầu không kiểm tra, trả lời mà không gọi tool.
+7. Muốn khẳng định hoặc bác bỏ trạng thái HIỆN TẠI của một dịch vụ (đang outage, đang bình thường...), phải gọi get_status cho provider đó (kèm component nếu có). Trạng thái của một incident (resolved, monitoring...) chỉ nói về incident đó, không thay cho trạng thái hiện tại của dịch vụ.'''
 
 URL_RE = re.compile(r'https?://[^\s)\]>"\'`]+')
+INCIDENT_LINK_RE = re.compile(r'https?://([^/\s]+)/incidents/([a-z0-9]+)')
+# Câu hỏi nói về trạng thái ở thời điểm HIỆN TẠI (dùng cho cổng get_status). Chỉ dùng từ chỉ thời điểm;
+# từ như "sập"/"outage" đứng riêng có thể nói về một sự kiện đã qua (H3: "vừa làm Cloudflare sập").
+CURRENT_STATE_RE = re.compile(r'(đang|hiện tại|hiện có|hiện nay|bây giờ)', re.I)
 
 
 def _result(status, answer, trace, usage, error=None):
@@ -88,10 +93,47 @@ def _missing_sources(answer, sources):
     return missing
 
 
+def _provider_for_host(host, default):
+    """Suy provider từ host của link (vd www.githubstatus.com → github); không khớp thì giữ provider hiện tại."""
+    for name, url in HOSTS.items():
+        if url.split('://', 1)[1] == host:
+            return name
+    return default
+
+
+def _flag_references(name, result, attempted, refs):
+    """Tìm link `/incidents/<id>` trong updates của incident vừa đọc.
+
+    ID được lấy nguyên văn từ tool result rồi ghi vào agent_note, để model gọi đúng ID thay vì tự chép lại.
+    """
+    if name != 'get_incident_details' or not isinstance(result, dict) or not result.get('ok'):
+        return result
+    found = []
+    for update in result.get('updates', []):
+        for host, iid in INCIDENT_LINK_RE.findall(str(update.get('body', ''))):
+            ref = (_provider_for_host(host, result.get('provider')), iid)
+            if iid != result.get('id') and ref not in attempted and ref not in found:
+                found.append(ref)
+    if not found:
+        return result
+    for ref in found:
+        refs.setdefault(ref, result.get('id'))
+    calls = '; '.join(f"get_incident_details(provider='{p}', incident_id='{i}')" for p, i in found)
+    note = (f'Update của incident này trỏ tới incident khác. Trước khi kết luận về nguyên nhân hay ảnh hưởng, '
+            f'hãy gọi: {calls}. Dùng đúng ID này, không tự chép lại.')
+    return {**result, 'agent_note': note}
+
+
 def run_agent(question, provider, tools, max_steps=6):
     """Trả dict: status (completed|max_steps|error), answer, trace, usage (+ error)."""
     messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': question}]
     trace, usage, sources = [], [], {}
+    # refs: incident được update trỏ tới -> incident nguồn; attempted: (provider, id) đã gọi get_incident_details;
+    # reminded: ref đã nhắc ở cổng cuối (chỉ nhắc một lần để không lặp vô hạn).
+    refs, attempted, reminded = {}, set(), set()
+    # Cổng get_status: provider được nhắc trong câu hỏi về trạng thái hiện tại; status_checked: đã gọi get_status.
+    asks_current = [p for p in HOSTS if p in question.casefold()] if CURRENT_STATE_RE.search(question) else []
+    status_checked, status_reminded = set(), False
     for step in range(1, max_steps + 1):
         # Lỗi provider kết thúc run: không báo hoàn thành.
         try:
@@ -113,6 +155,31 @@ def run_agent(question, provider, tools, max_steps=6):
                 trace.append({'event': 'error', 'step': step, 'error': f'finish={finish}'})
                 return _result('error', message.get('content') or '', trace, usage, f'Model dừng với lý do không hợp lệ: {finish}')
             answer = message.get('content') or ''
+            # Cổng đọc liên kết (v3): còn incident được trỏ tới mà chưa gọi thì nhắc một lần, kèm đúng ID.
+            # Không nhắc ở step cuối: không còn budget để gọi tool nên chỉ biến completed thành max_steps.
+            unread = [r for r in refs if r not in attempted and r not in reminded]
+            if unread and step < max_steps:
+                reminded.update(unread)
+                trace.append({'event': 'validation_unread_reference', 'step': step,
+                              'unread': [{'provider': p, 'incident_id': i, 'from': refs[(p, i)]} for p, i in unread]})
+                calls_hint = '; '.join(f"get_incident_details(provider='{p}', incident_id='{i}')" for p, i in unread)
+                messages.append({'role': 'user', 'content': (
+                    '[Kiểm tra tự động của hệ thống] Một update đã đọc trỏ tới incident khác nhưng bạn chưa đọc nó. '
+                    f'Hãy gọi {calls_hint} (dùng đúng ID), rồi viết lại câu trả lời cuối dựa trên dữ liệu đó.')})
+                continue
+            # Cổng get_status (v3): câu hỏi về trạng thái hiện tại mà chưa gọi get_status thì nhắc một lần.
+            # Chỉ áp dụng khi agent đã dùng tool (câu hỏi ngoài phạm vi/không được kiểm tra thì bỏ qua).
+            no_status = [p for p in asks_current if p not in status_checked]
+            used_tools = any(x['event'] == 'tool' for x in trace)
+            if no_status and used_tools and not status_reminded and step < max_steps:
+                status_reminded = True
+                trace.append({'event': 'validation_missing_status', 'step': step, 'providers': no_status})
+                hint = '; '.join(f"get_status(provider='{p}')" for p in no_status)
+                messages.append({'role': 'user', 'content': (
+                    '[Kiểm tra tự động của hệ thống] Câu hỏi nói về trạng thái HIỆN TẠI nhưng bạn chưa kiểm tra '
+                    f'trạng thái hiện tại. Trạng thái của một incident không thay cho trạng thái dịch vụ. Hãy gọi {hint} '
+                    '(kèm component liên quan nếu có), rồi viết lại câu trả lời cuối.')})
+                continue
             # Cổng kiểm tra nguồn (Bài 4): thiếu URL incident đã đọc thì yêu cầu sửa trong budget.
             missing = _missing_sources(answer, sources)
             if not missing:
@@ -136,6 +203,11 @@ def run_agent(question, provider, tools, max_steps=6):
                 except Exception as exc:  # tool lỗi bất ngờ vẫn là observation
                     result = {'ok': False, 'error': type(exc).__name__, 'message': str(exc)[:200]}
             result = _annotate_error(args, result)
+            if call['name'] == 'get_incident_details' and isinstance(args, dict):
+                attempted.add((args.get('provider'), args.get('incident_id')))
+            if call['name'] == 'get_status' and isinstance(args, dict):
+                status_checked.add(args.get('provider'))
+            result = _flag_references(call['name'], result, attempted, refs)
             _record_source(sources, call['name'], result)
             trace.append({'event': 'tool', 'step': step, 'name': call['name'],
                           'arguments': args if args is not None else call.get('arguments'), 'result': result})

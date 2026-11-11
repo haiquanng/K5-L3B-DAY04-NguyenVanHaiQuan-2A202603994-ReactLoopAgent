@@ -94,3 +94,57 @@ Nhật ký từng vòng: sửa gì, vì sao, kết quả đo được. Cấu hì
 **Việc tiếp theo (v3)**: đưa hai hành vi này từ prompt vào code.
 - (1) Code đọc ID incident được trỏ tới từ nội dung update và nhắc model đọc đúng ID đó. ID được lấy nguyên văn từ tool result, nên tránh được lỗi gõ sai ID như H6.
 - (2) Câu hỏi về trạng thái hiện tại thì phải có `get_status`.
+
+## v3 — Chuyển H1/H2 từ prompt sang code (`versions/v3/agent.py`)
+
+**Vấn đề nhắm tới**
+- H1/H6: không đọc, hoặc đọc sai ID, incident được update trỏ tới.
+- H2: khẳng định trạng thái hiện tại mà không gọi `get_status`.
+
+**Thay đổi**
+1. **Nhắc đọc incident được trỏ tới (`_flag_references`)**:
+   - Khi `get_incident_details` thành công, code quét nội dung update tìm link `/incidents/<id>` và suy provider từ host.
+   - Nếu incident đó chưa được gọi, code gắn `agent_note` vào observation, kèm lời gọi mẫu với **ID nguyên văn**, ví dụ `get_incident_details(provider='github', incident_id='xr3myzj7ms51')`.
+   - Chốt chặn cuối: nếu model trả lời mà vẫn chưa gọi incident đó, agent ghi `validation_unread_reference`, nhắc **một lần** rồi gọi model tiếp.
+   - Không nhắc ở step cuối: khi đó không còn bước để gọi tool, nhắc chỉ làm `completed` thành `max_steps`.
+   - Một ID gõ sai không được tính là đã đọc.
+   - Trong snapshot chỉ có 2 liên kết loại này (`h02n9572mx9y` → `xr3myzj7ms51`, `qpfv5p86dmrl` → `djlmxz2zd0j7`), nên cổng không kích hoạt bừa.
+2. **Quy tắc `get_status` cho trạng thái hiện tại**:
+   - Thêm quy tắc 7 vào prompt. Chạy H2 hai lần, cả hai vẫn 50, nên thêm chốt chặn bằng code.
+   - Câu hỏi có từ chỉ thời điểm hiện tại (`đang`, `hiện tại`, `hiện có`, `hiện nay`, `bây giờ`), có nhắc provider, agent đã dùng tool nhưng chưa gọi `get_status` cho provider đó → ghi `validation_missing_status` và nhắc một lần.
+   - Bản đầu của điều kiện còn bắt cả "outage", "operational", "sập" và kích hoạt ở H3 ("vừa làm Cloudflare sập"). Agent khi đó dẫn trạng thái "Partial System Outage" không liên quan tới ID giả, và H3 giảm **100 → 89**. Tôi thu hẹp điều kiện về từ chỉ thời điểm; chạy lại H3 được 100. Lúc này chỉ 5 câu hỏi đủ điều kiện (E1, E6, H2, H5, H7), và chỉ H2 thiếu `get_status`.
+3. Thêm 8 test vào `tests/test_improvements.py`:
+   - 5 test `ReferenceGateTests`: observation chứa đúng ID, nhắc một lần rồi đọc, chỉ nhắc một lần, không nhắc ở step cuối, gõ sai ID vẫn bị nhắc;
+   - 3 test `StatusGateTests`: câu hỏi trạng thái hiện tại phải có `get_status`, đã gọi thì không nhắc, câu ngoài phạm vi hoặc hỏi lịch sử thì không nhắc.
+
+**Kết quả chạy riêng (2 lần mỗi case)**
+- H1: **99, 98**. Model đọc `xr3myzj7ms51` ngay ở step 2 nhờ `agent_note`, không cần đến chốt chặn cuối.
+- H2: lúc chỉ có quy tắc prompt được 50, 50; có cổng code được **100, 100**.
+- H6: 97, lần này đọc đúng `xr3myzj7ms51` (`ok: true`).
+- H3: 89 với điều kiện rộng, **100** sau khi thu hẹp. H4: 100, không gọi tool.
+- Unit test: 52/52 pass.
+
+## Eval lần 3 (bản v3, cả bộ) → `eval_after.json`: **99.59/100**
+
+| Chỉ số | v0 `eval_before.json` | v2 (eval lần 2) | v3 `eval_after.json` |
+|---|---|---|---|
+| Điểm tổng | 94.41 | 95.14 | **99.59** |
+| H1 | 60 | 60 | **99** |
+| H2 | 100 | 50 | **100** |
+| H6 | 60 | 97 (judge chấm sai) | **100** |
+| H7 | 65 | 100 | **100** |
+| Case thấp nhất | 60 | 50 | 97 (A6) |
+| Model calls | 47 | 52 | 53 |
+| Prompt tokens | 27,676 | 47,341 | 50,859 |
+| Completion tokens | 5,707 | 7,725 | 6,815 |
+
+- Đã đối chiếu trace của H1, H6, A6: cả ba đọc `xr3myzj7ms51` thành công và dẫn URL của nó. H2 gọi `get_status` sau lời nhắc. Không còn trường hợp điểm cao mà hành vi sai.
+- Trong lần chạy này, chỉ có 1 lần nhắc bằng cổng (`validation_missing_status` ở H2). H1 và H6 làm đúng ngay nhờ `agent_note`.
+- Các case khác dao động 97–100 (E1 98, E3 98, A6 97, A7 99), không có lỗi hành vi trong trace.
+- Chi phí: prompt tokens tăng ~84% so với v0 (system prompt dài hơn, `agent_note` và các bước nhắc), đổi lại agent không còn đi sai ở các case nhiều bước.
+
+**Giới hạn**
+- Mỗi phiên bản chỉ chạy cả bộ một lần. Riêng H1, H2 chạy 2 lần.
+- Judge (gpt-4.1) có thể chấm sai: ví dụ H6 ở eval lần 2.
+- Các cổng dựa trên quy tắc chuỗi (regex link `/incidents/<id>`, từ chỉ thời điểm hiện tại). Chúng không hiểu ngữ nghĩa và có thể bỏ sót cách diễn đạt khác.
+- Điều kiện của cổng `get_status` đã được chỉnh sau khi thấy H3, nên có nguy cơ khớp quá sát bộ eval.
